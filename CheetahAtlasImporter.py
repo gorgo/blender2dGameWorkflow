@@ -2,6 +2,8 @@ import bpy
 from mathutils import Vector
 import bmesh
 
+cache = {}
+
 def unix_slashes(input):
     return input.replace('\\','/')
 
@@ -30,8 +32,69 @@ class CheetahAtlasLayout(bpy.types.Panel):
         row = layout.row()
         row.operator("cheetah.atlas_import")
 
+# anchor point
+
+def persistAnchorPoint(ob, anchor):
+    ob['_anchorPoint0'] = anchor[0]
+    ob['_anchorPoint1'] = anchor[1]
+
+def getAnchorPointBounds(obj):
+    max = [-999999999.0, -999999999.0]
+    min = [999999999.0, 99999999.0]
+    for vert in obj.data.vertices:
+        if vert.co[0] > max[0]: max[0] = vert.co[0]
+        if vert.co[2] > max[1]: max[1] = vert.co[2]
+        if vert.co[0] < min[0]: min[0] = vert.co[0]
+        if vert.co[2] < min[1]: min[1] = vert.co[2]
+    return (min, max)    
+
+def getAnchorPointActual(ob):
+    bounds = getAnchorPointBounds(ob)
+    return (-(bounds[0][0] / (bounds[1][0] - bounds[0][0])),-(bounds[0][1] / (bounds[1][1] - bounds[0][1])))
+
+def setAnchorPoint(obj, point):
+    bounds = getAnchorPointBounds(obj)
+    min = bounds[0]
+    max = bounds[1]
+    
+    translateX = -(max[0] - min[0]) * point[0] - min[0]
+    translateZ = -(max[1] - min[1]) * point[1] - min[1]
+    for vert in obj.data.vertices:
+        vert.co[0] += translateX
+        vert.co[2] += translateZ
 
 
+class SetAnchorPointOperator(bpy.types.Operator):
+    bl_idname = "object.set_anchor_point"  
+    bl_label = "Set Anchor Point"  
+    bl_options = {'REGISTER', 'UNDO'}  
+    
+    anchorPoint = bpy.props.FloatVectorProperty(size=2)
+  
+    def execute(self, context):  
+        setAnchorPoint(context.active_object, self.anchorPoint)
+        persistAnchorPoint(context.active_object, self.anchorPoint)
+        return {'FINISHED'}  
+    
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row()
+        row.prop(self, "anchorPoint")
+
+    def invoke(self, context, event):
+        anchorStored = getAnchorPointStored(context.active_object)
+        if anchorStored: self.anchorPoint = anchorStored
+        else: self.anchorPoint = getAnchorPointActual(context.active_object)
+        return self.execute(context)
+
+def getAnchorPointStored(ob):
+    if '_anchorPoint0' in ob: return (ob['_anchorPoint0'], ob['_anchorPoint1'])
+    else: return False
+
+
+def restoreAnchorPoint(ob):
+    anchorStored = getAnchorPointStored(ob)
+    if anchorStored: setAnchorPoint(ob, anchorStored)
 
 import os.path
 
@@ -117,27 +180,38 @@ class CheetahImportAtlas(Operator, ImportHelper):
     
     def read_cheetah_atlas(self, context, filepath):
         atlasesHolder = None
+        
+        # place to some layer TODO: make parameter
+        activeLayer = 10
+        layersSet = [
+            False, False, False, False, False,    False, False, False, False, False, 
+            False, False, False, False, False,    False, False, False, False, False  ]
+        layersSet[activeLayer] = True
+        oldLayerState = bpy.context.scene.layers[activeLayer]
+        bpy.context.scene.layers[activeLayer] = True
+        
         if "atlases" in bpy.data.objects:
             atlasesHolder = bpy.data.objects["atlases"]
         else:
-            bpy.ops.object.empty_add(type='PLAIN_AXES', radius=1, view_align=False, location=(0, 0, 0), layers=(True, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False))
+            bpy.ops.object.empty_add(type='PLAIN_AXES', radius=1, view_align=False, location=(0, 0, 0), layers=layersSet)
             atlasesHolder = bpy.context.active_object
-            atlasesHolder.location[0] = -5;
             atlasesHolder.name = "atlases"
+
         
         # if atlas already exists, skip it
         for atlas in atlasesHolder.children:
             if atlas["path"] == filepath: return {'FINISHED'}
         
         atlasHolder = None
-        bpy.ops.object.empty_add(type='PLAIN_AXES', radius=1, view_align=False, location=(0, 0, 0), layers=(True, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False))
+        bpy.ops.object.empty_add(type='PLAIN_AXES', radius=1, view_align=False, location=(0, 0, 0), layers=layersSet)
         atlasHolder = bpy.context.active_object
         atlasHolder.parent = atlasesHolder
         atlasHolder['path'] = filepath
+
         try: 
             atlasHolder.name = unix_slashes(os.path.relpath(filepath, bpy.context.scene.cheetah_relpath))
         except:
-            atlasHolder.name = unix_slashes(os.path.basename(filepath))
+            atlasHolder.name = unix_slashevis(os.path.basename(filepath))
         atlasHolder['name'] = atlasHolder.name
         
         f = open(filepath, 'r', encoding='utf-8')
@@ -148,7 +222,8 @@ class CheetahImportAtlas(Operator, ImportHelper):
         
         mat = bpy.data.materials.new(atlasHolder.name)
         mat.use_shadeless = True
-        
+        mat.use_transparency = True
+
         tex = bpy.data.textures.new(atlasHolder.name, type = 'IMAGE')
         tex.image = img
         
@@ -161,7 +236,6 @@ class CheetahImportAtlas(Operator, ImportHelper):
         for line in iter(data.splitlines()):
             if line[:9] == "textures:": continue
             frameData = line.split('\t')
-            print(frameData)
             fName   = frameData[0]
             xPos    = int(float(frameData[1]))
             yPos    = int(float(frameData[2]))
@@ -204,8 +278,15 @@ class CheetahImportAtlas(Operator, ImportHelper):
                 
             ob = self.createMesh(fName, verts, uvs, img, mat, atlasHolder)
             ob["name"] = fName
+
+            if prevOb: print(prevOb.location[2])
             if prevOb: ob.location[2] = prevOb.bound_box[6][2] + prevOb.location[2]
+            ob.data.update()
             prevOb = ob
+
+            ob.layers = layersSet
+        bpy.context.scene.update()
+        bpy.context.scene.layers[activeLayer] = oldLayerState
         
         return {'FINISHED'}
     
@@ -250,6 +331,17 @@ def setSpriteFrame(src, dst):
         
     dst['sprite'] = src.parent['name']+'|'+src['name']
 
+def setSpriteFrameById(ob, id):
+    parts = id.split('|')
+    dst = ob
+    src = None
+    for atlas in bpy.data.objects['atlases'].children:
+        if atlas['name'] == parts[0]: break
+    for src in atlas.children:
+        if src['name'] == parts[1]: break
+    setSpriteFrame(src, dst)
+    restoreAnchorPoint(dst)
+
 def getAtlasItems(self, context):
     items = []
     for atlas in bpy.data.objects['atlases'].children:
@@ -264,6 +356,12 @@ def getFrameItems(self, context):
         items.append((frame['name'],frame['name'], ""))
     return items
 
+def getDefaultAtlas(self, context):
+    print("susanna")
+    return ""
+
+def getFrameIdOfFrameObject(ob):
+    return ob.parent['name'] + '|' + ob['name']
     
 class CheetahSetSpriteFrame(Operator):
     """Set Frame To Sprite"""
@@ -281,7 +379,6 @@ class CheetahSetSpriteFrame(Operator):
           items=getFrameItems, 
           name="Frame Name", description="One of the selected atlas frame")
 
-            
     def execute(self, context):
         dst = context.active_object
         src = None
@@ -290,15 +387,19 @@ class CheetahSetSpriteFrame(Operator):
         for src in atlas.children:
             if src['name'] == self.frameName: break
         setSpriteFrame(src, dst)
+        restoreAnchorPoint(dst)
         return {'FINISHED'}
 
     def invoke(self, context, event):
+        parts = context.active_object['sprite'].split('|')
+        atlasName = parts[0]
+        frameName = parts[1]
         return self.execute(context)
     
 class CheetahAddSpriteOperator(Operator):
     """Add a new cheetah sprite object"""
     bl_idname = "cheetah.add_sprite_frame"  # important since its how bpy.ops.import_test.some_data is constructed
-    bl_label = "Add Cheetah Sprite"
+    bl_label = "Cheetah Sprite"
     bl_options = {'REGISTER', 'UNDO'}
 
     atlasName = bpy.props.EnumProperty(
@@ -308,7 +409,8 @@ class CheetahAddSpriteOperator(Operator):
     frameName = bpy.props.EnumProperty(
           items=getFrameItems, 
           name="Frame Name", description="One of the selected atlas frame")
-
+    
+    anchorPoint = bpy.props.FloatVectorProperty(size=2, default=(0.5,0.5))
     
     def execute(self, context):
         edges = []
@@ -316,6 +418,8 @@ class CheetahAddSpriteOperator(Operator):
         name = "sprite"
         verts = []
         parent = context.active_object
+        if parent and not parent.select: parent = None
+        
         for i in range(0,6): verts.append(Vector((0,0,0)))
         
         mesh = bpy.data.meshes.new(name=name)
@@ -327,6 +431,12 @@ class CheetahAddSpriteOperator(Operator):
         scn.objects.active = ob
         
         ob.parent = parent #todo: add is mesh assert for parent
+        targetLocation = context.space_data.cursor_location
+        if parent: 
+            targetLocation = parent.matrix_world.inverted() * targetLocation
+        ob.location = targetLocation
+        ob.lock_location[1] = True
+        ob.lock_rotation[0] = ob.lock_rotation[2] = True
         
         mesh.update()
         bm = bmesh.new()
@@ -352,9 +462,123 @@ class CheetahAddSpriteOperator(Operator):
         for src in atlas.children:
             if src['name'] == self.frameName: break
         setSpriteFrame(src, dst)
-        return {'FINISHED'}
         
-    
+        # set anchor point
+        setAnchorPoint(ob, self.anchorPoint)
+        persistAnchorPoint(ob, self.anchorPoint)
+        
+        #select only object
+        bpy.ops.object.select_all(action='DESELECT')
+        ob.select = True
+        context.scene.objects.active = ob
+        return {'FINISHED'}
+                 
+class AddSingleFrameDriverOperator(Operator):
+    """Add single frame driver"""
+    bl_idname = "cheetah.add_frame_driver" 
+    bl_label = "Add Frame Driver"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    atlasName = bpy.props.EnumProperty(
+          items=getAtlasItems,
+          name="Atlas Name", description="One of the imported atlases")
+
+    frameName = bpy.props.EnumProperty(
+          items=getFrameItems,
+          name="Frame Name", description="One of the selected atlas frame")
+
+    anchorPoint = bpy.props.FloatVectorProperty(size=2, default=(0.5,0.5))
+
+    def execute(self, context):
+        if len(context.selected_objects) == 1:
+            frameId = self.atlasName + '|' + self.frameName
+        else:
+            frameId = getFrameIdOfFrameObject(context.active_object)
+        
+        sprite = None
+        if 'sprite' in context.selected_objects[0]:
+            sprite = context.selected_objects[0]
+        else: sprite = context.selected_objects[1]
+         
+        
+        empty = bpy.data.objects.new("Driver", None)
+        context.scene.objects.link(empty)
+        context.scene.update()
+        empty['driver'] = True
+        empty['frame'] = frameId
+        empty['enabled'] = False
+        empty.parent = sprite
+        
+        
+        
+        return {'FINISHED'}
+
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column()
+        if len(context.selected_objects) == 1:
+            col.prop(self, "atlasName")
+            col.prop(self, "frameName")
+
+class AddClickAnimationOperator(Operator):
+    """Add click keyframes for object, such as singleFrameDriver"""
+    bl_idname = "cheetah.add_click_animation" 
+    bl_label = "Add Click Animation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        driver = context.active_object        
+        cf = context.scene.frame_current
+        
+        driver.location = 0.0, 0.0, 1.5
+        driver.keyframe_insert(data_path='location', frame=(cf))
+
+        driver.location = 0.0, 0.0, 0.0
+        driver.keyframe_insert(data_path='location', frame=(cf-1))
+        driver.keyframe_insert(data_path='location', frame=(cf+1))
+        
+        for fcurve in driver.animation_data.action.fcurves:
+            if fcurve.data_path == 'location':
+                fcurve.extrapolation = 'CONSTANT'
+                for keyframe in fcurve.keyframe_points:
+                    keyframe.interpolation = 'CONSTANT'
+        
+        driver.location = 0.0, 0.0, 3.0
+        driver.keyframe_insert(data_path='location', frame=(cf-2))
+        driver.keyframe_insert(data_path='location', frame=(cf+2))
+                
+        
+        return {'FINISHED'}
+
+
+  
+def menu_func(self, context):
+    if context.mode == 'OBJECT': self.layout.operator(CheetahAddSpriteOperator.bl_idname, icon='UV_FACESEL')
+
+from math import *
+
+############ animation
+def preFrameHandler(scene):
+    print("Frame Change", scene.frame_current)
+    for ob in bpy.data.objects:
+        if 'driver' in ob: 
+            print('driver found')
+            if 'frame' in ob: # single frame type
+                if not ob['enabled'] and ob.location[2] > 1:
+                    ob['enabled'] = True
+                    setSpriteFrameById(ob.parent, ob['frame'])
+                    
+                elif ob['enabled'] and ob.location[2] < 1:
+                    ob['enabled'] = False
+
+            if 'framePattern' in ob: # pattern frame type
+                if ob.location[2] > 1:
+                    frame = round(floor(ob.location[2] - 1) * ob['frameIncrement'] + ob['startFrame'])
+                    if not frame == ob['currentFrame']:
+                        ob['currentFrame'] = frame
+                        setSpriteFrameById(ob.parent, ob['framePattern'] % (frame))
+
     
 def register():
     bpy.types.Scene.cheetah_relpath = bpy.props.StringProperty \
@@ -374,7 +598,12 @@ def register():
     bpy.utils.register_class(CheetahAtlasLayout)
     bpy.utils.register_class(CheetahSetSpriteFrame)
     bpy.utils.register_class(CheetahAddSpriteOperator)
-
+    bpy.utils.register_class(SetAnchorPointOperator)
+    bpy.utils.register_class(AddSingleFrameDriverOperator)
+    bpy.utils.register_class(AddClickAnimationOperator)
+    bpy.types.INFO_MT_mesh_add.append(menu_func)
+    bpy.app.handlers.frame_change_pre.clear()
+    bpy.app.handlers.frame_change_pre.append(preFrameHandler)        
 
 def unregister():
     del bpy.types.Scene.cheetah_relpath
@@ -383,6 +612,11 @@ def unregister():
     bpy.utils.unregister_class(CheetahAtlasLayout)
     bpy.utils.unregister_class(CheetahSetSpriteFrame)
     bpy.utils.unregister_class(CheetahAddSpriteOperator)
+    bpy.utils.unregister_class(SetAnchorPointOperator)
+    bpy.utils.unregister_class(AddSingleFrameDriverOperator)
+    bpy.utils.unregister_class(AddClickAnimationOperator)
+    bpy.types.INFO_MT_mesh_add.remove(menu_func)
+    bpy.app.handlers.frame_change_pre.remove(preFrameHandler)        
 
 
 
